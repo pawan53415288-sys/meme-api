@@ -1,0 +1,16 @@
+node_modules
+
+# Environment / secrets
+.env
+.env.local
+.env.*.local
+
+# Editor directories and files
+.vscode/*
+.idea
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?

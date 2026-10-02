@@ -1,0 +1,20 @@
+{
+  "name": "meme-api",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "description": "Express API that generates AI meme text and renders it onto memegen.link templates.",
+  "main": "src/index.js",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "node --watch-path=./src --watch-path=./.env src/index.js"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "dotenv": "^17.4.2",
+    "express": "^5.2.1"
+  }
+}
