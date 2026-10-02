@@ -64,7 +64,9 @@ if (-not $projectOk) {
   Write-Host ''
   Write-Host 'Stopping: the token cannot reach meme-api-inky, so env vars cannot be set.' -ForegroundColor Red
   if ($tokenScopeNote) {
-    Write-Host 'The token itself is invalid (the API rejected it outright). Create a new one.' -ForegroundColor Red
+    Write-Host 'Both /v2/user and the project returned 404. That means this token' -ForegroundColor Yellow
+    Write-Host 'belongs to a different Vercel account (or you pasted the token NAME' -ForegroundColor Yellow
+    Write-Host 'instead of its one-time value). It is not simply an expired token.' -ForegroundColor Yellow
   }
   exit 1
 }
