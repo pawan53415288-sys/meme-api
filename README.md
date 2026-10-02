@@ -51,6 +51,7 @@ Useful as a deploy smoke-test and to confirm env vars loaded.
 | Status | When |
 | ------ | ---- |
 | `400`  | `category` missing or not recognised |
+| `429`  | Rate limit hit — more than 10 requests in 10 minutes from one IP |
 | `502`  | Upstream (OpenRouter / memegen) failed |
 | `504`  | Ran out of the time budget — worth retrying |
 
@@ -100,33 +101,65 @@ Vite's dev proxy in `meme-web/vite.config.ts` already handles this if you leave
 | `OPEN_ROUTER_API_KEY` | **yes** | — | From <https://openrouter.ai/keys>. Without it every request fails with `OPEN_ROUTER_API_KEY is missing from .env`. |
 | `OPENROUTER_MODEL` | no | — | Pin one `vendor/model:free` id to try it first, ahead of the built-in fallback list. |
 | `PORT` | no | `8787` | Set automatically by most PaaS providers. |
-| `ALLOWED_ORIGINS` | no | *(any origin)* | Comma-separated allowed browser origins, e.g. `https://meme-web.vercel.app`. **Set this in production** so the API isn't usable as an open relay from any site. |
+| `ALLOWED_ORIGINS` | in production | Comma-separated allowed browser origins, e.g. `https://meme-web.vercel.app`. **Required in production** — the service exits at boot if it's missing, rather than serving as an open relay. |
+
+---
+
+## Abuse protection
+
+This endpoint is unauthenticated and every call spends OpenRouter quota, so two
+guards are on by default:
+
+1. **Rate limit** — 10 requests per 10 minutes per IP on `POST /api/memes`,
+   returning `429` with a readable message. Loose enough that a real user never
+   hits it, tight enough that a script looping the endpoint runs dry.
+2. **CORS allow-list** — in production the service refuses to start without
+   `ALLOWED_ORIGINS`, so it can't be driven from an arbitrary page.
+
+Both are best-effort, not exact: the limiter keeps counts in memory, so they
+reset when the instance sleeps, and each instance counts separately. Behind more
+than one instance, swap in a shared store (Redis) via `express-rate-limit`.
+
+`app.set('trust proxy', 1)` is what makes the per-IP limit correct behind
+Render's proxy — without it every visitor would share one address and the limit
+would apply globally.
 
 ---
 
 ## Deployment
 
-Any Node host works — the service only needs `npm start` and Node 20+.
+`render.yaml` is included, so deploying to Render is: **New → Blueprint → point
+at this repo**. Render builds with `npm install`, runs `npm start`, and health
+checks `/api/health`.
 
-- **Vercel / Render / Railway / Fly.io** — build `npm install`, start `npm start`.
-- **Docker** — `node:20-alpine` base, `CMD ["npm","start"]`.
+**The first deploy is expected to fail.** `NODE_ENV=production` is set by the
+blueprint, and the service exits without `ALLOWED_ORIGINS`. In the Render
+dashboard add these as **Secret** env vars, then redeploy:
 
-Remember to set `OPEN_ROUTER_API_KEY` and `ALLOWED_ORIGINS` in the host's
-dashboard — not in the repo.
+| Key | Value |
+| --- | ----- |
+| `OPEN_ROUTER_API_KEY` | your key from <https://openrouter.ai/keys> |
+| `ALLOWED_ORIGINS` | your frontend URL, e.g. `https://meme-web.vercel.app` |
 
-Then set `VITE_API_URL` on the **frontend** to the deployed API URL and rebuild
-the frontend. `VITE_*` values are baked in at build time, so changing one needs
-a redeploy.
+Other hosts work fine too — they just need `npm install` + `npm start` on Node 20+,
+with the same two env vars set.
 
-### Two things to know before going live
+### Why Render and not Vercel
 
-1. **Free OpenRouter models are rate-limited and slow.** A 30–60s response
-   exceeds the default timeout on many hosts (Vercel Functions cap around 10–60s
-   depending on plan). If you deploy to Vercel, either use a plan with a longer
-   function timeout or lower `TOTAL_BUDGET_MS` in `src/openrouter.js`.
-2. **There is no rate limiting.** The endpoint is unauthenticated and every call
-   spends key quota. Put a rate limiter (e.g. `express-rate-limit`) in front of
-   it before exposing it publicly.
+A real request takes **30–60s**, because the free OpenRouter models that actually
+answer are slow reasoning models. Vercel (10–60s) and Netlify (10s) kill requests
+under that, so the app would return `504` in production while working perfectly
+on localhost. Render has no hard request timeout, which is what this workload
+needs.
+
+Set `VITE_API_URL` on the **frontend** to the deployed API URL and rebuild it.
+`VITE_*` values are baked in at build time, so changing one needs a redeploy.
+
+### Free-tier behaviour to expect
+
+- Instances sleep after 15 min idle and take ~30s to wake. The client timeout is
+  120s, so it still succeeds — it just feels slow on the first request.
+- The in-memory rate limit resets when an instance wakes.
 
 ---
 

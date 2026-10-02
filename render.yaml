@@ -1,0 +1,39 @@
+# Render blueprint — https://render.com/docs/blueprint-spec
+#
+# Deploying: New → Blueprint → point it at this repo. Render reads this file and
+# creates the web service.
+#
+# Env vars are NOT set here (that would put the OpenRouter key in git). Set them
+# in the Render dashboard after the first deploy, then redeploy:
+#   OPEN_ROUTER_API_KEY = <your key>
+#   ALLOWED_ORIGINS     = https://<your-frontend-host>
+#
+# The service intentionally exits at boot if ALLOWED_ORIGINS is missing, so the
+# first deploy is expected to fail once, before you set the variables.
+
+services:
+  - type: web
+    name: meme-api
+    runtime: node
+    plan: free
+    region: singapore
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /api/health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      # Add OPEN_ROUTER_API_KEY and ALLOWED_ORIGINS as "Secret" in the dashboard.
+      # sync: false keeps their values out of this file and out of git history.
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Notes on the free plan, since this API is a poor fit for cheap serverless:
+#
+# • Free instances sleep after 15 min idle and take ~30s+ to wake. The frontend
+#   client timeout is 120s, so the first request after a pause still succeeds,
+#   but it will feel very slow. A paid `starter` plan removes the sleeping.
+# • This app is fine on Render specifically because there is no hard request
+#   timeout here — a real call takes 30-60s, which Vercel/Netlify would kill.
+# • The in-memory rate limiter resets whenever the instance sleeps, so the cap
+#   is best-effort, not exact. Behind multiple instances each keeps its own
+#   count; swap in a shared store (Redis) if you ever scale past one.

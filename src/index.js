@@ -15,23 +15,46 @@
 import 'dotenv/config'
 import express from 'express'
 import cors from 'cors'
+import rateLimit from 'express-rate-limit'
 import { createMemes } from './memes-core.js'
 
 const app = express()
 app.disable('x-powered-by')
 
+// Render (and every other reverse-proxy host) terminates TLS in front of us, so
+// req.ip is the proxy's address unless we trust one hop of X-Forwarded-For.
+// Without this the rate limiter would see every visitor as the same single IP —
+// i.e. a global cap rather than a per-user one. `1` trusts exactly one proxy
+// hop, which is correct for a single front-end proxy and no deeper.
+app.set('trust proxy', 1)
+
+const isProduction = process.env.NODE_ENV === 'production'
+
 // ─── CORS ─────────────────────────────────────────────────────────────────────
 // The frontend is a separate app on a separate origin, so the browser blocks
 // the call unless we say otherwise.
 //
-// ALLOWED_ORIGINS is left unset during development so `vite`'s proxy works
-// untouched. In production, set it to the deployed frontend URL — that keeps
-// the API from being called as an open relay by any site someone pastes the
-// URL into.
+// Unset in development, so `vite`'s proxy works untouched. In production it is
+// REQUIRED — see the guard below — and set to the deployed frontend URL.
 const allowedOrigins = (process.env.ALLOWED_ORIGINS ?? '')
   .split(',')
   .map((origin) => origin.trim())
   .filter(Boolean)
+
+// Fail fast instead of shipping an open relay. Every call to this endpoint
+// spends OpenRouter quota, so an API with no origin allow-list is a way for
+// anyone who finds the URL to drain the key. Refusing to boot is loud and
+// obvious; defaulting to "*" quietly isn't.
+if (isProduction && allowedOrigins.length === 0) {
+  console.error(
+    '\n' +
+      '✖ ALLOWED_ORIGINS is required in production.\n' +
+      '  Set it to your deployed frontend origin, comma-separated for several:\n' +
+      '    ALLOWED_ORIGINS=https://meme-web.vercel.app\n' +
+      '  See .env.example.\n'
+  )
+  process.exit(1)
+}
 
 app.use(
   cors({
@@ -51,7 +74,25 @@ app.get('/api/health', (_req, res) => {
   })
 })
 
-app.post('/api/memes', async (req, res) => {
+// A real request costs an OpenRouter call and occupies the process for up to
+// ~90s, so the cap is deliberately loose — generous enough that an actual user
+// never hits it, tight enough that a script looping the endpoint runs dry.
+// The long `windowMs` matters here: a short window over a 60s-long request
+// would let more calls be in flight than the limit is meant to permit.
+const generateLimiter = rateLimit({
+  windowMs: 10 * 60_000,
+  limit: 10,
+  standardHeaders: 'draft-7',
+  legacyHeaders: false,
+  // Match the rest of the API's error shape so the frontend can surface it
+  // through the same code path as every other failure.
+  handler: (_req, res) =>
+    res.status(429).json({
+      error: 'Too many memes requested. Please wait a few minutes and try again.',
+    }),
+})
+
+app.post('/api/memes', generateLimiter, async (req, res) => {
   try {
     const memes = await createMemes(req.body?.category)
     res.json({ memes })
