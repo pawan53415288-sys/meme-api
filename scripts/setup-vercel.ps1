@@ -25,17 +25,56 @@ $env:VERCEL_TOKEN = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr)
 
 if (-not $env:VERCEL_TOKEN) { throw 'No token entered.' }
 
-Write-Host ''
-Write-Host 'Verifying token...' -ForegroundColor Cyan
-vercel whoami
-if ($LASTEXITCODE -ne 0) { throw 'Token rejected by Vercel. Check it and try again.' }
+# ─── 2. Verify with the REST API, NOT `vercel whoami` ──────────────────────────
+# `vercel whoami` resolves a *user* and prints "User not found" for a perfectly
+# valid token that is scoped to a team, or to an account with no user profile.
+# Failing on that is wrong — it blocks setup over a cosmetic CLI quirk. So we ask
+# the API directly what the token can actually do.
+$apiHeaders = @{ Authorization = "Bearer $env:VERCEL_TOKEN" }
 
-# ─── 2. Link the project ───────────────────────────────────────────────────────
+Write-Host ''
+Write-Host 'Checking token against the Vercel API...' -ForegroundColor Cyan
+
+$tokenScopeNote = $false
+try {
+  $me = Invoke-RestMethod 'https://api.vercel.com/v2/user' -Headers $apiHeaders -Method Get
+  Write-Host "  user: $($me.user.username) (id $($me.user.id))" -ForegroundColor Green
+} catch {
+  $code = $_.Exception.Response.StatusCode.value__
+  Write-Host "  GET /v2/user -> HTTP $code" -ForegroundColor Yellow
+  $tokenScopeNote = $true
+}
+
+# Project access is what actually matters for the steps below.
+$projectOk = $false
+try {
+  $p = Invoke-RestMethod 'https://api.vercel.com/v9/projects/meme-api-inky' -Headers $apiHeaders -Method Get
+  Write-Host "  project meme-api-inky: found (id $($p.id))" -ForegroundColor Green
+  $projectOk = $true
+} catch {
+  $code = $_.Exception.Response.StatusCode.value__
+  Write-Host "  GET /v9/projects/meme-api-inky -> HTTP $code" -ForegroundColor Yellow
+  if ($code -eq 404) {
+    Write-Host '  The token cannot see this project. Either it belongs to a different' -ForegroundColor Red
+    Write-Host '  account, or the project name is wrong.' -ForegroundColor Red
+  }
+}
+
+if (-not $projectOk) {
+  Write-Host ''
+  Write-Host 'Stopping: the token cannot reach meme-api-inky, so env vars cannot be set.' -ForegroundColor Red
+  if ($tokenScopeNote) {
+    Write-Host 'The token itself is invalid (the API rejected it outright). Create a new one.' -ForegroundColor Red
+  }
+  exit 1
+}
+
+# ─── 3. Link the project ───────────────────────────────────────────────────────
 Write-Host ''
 Write-Host 'Linking to meme-api-inky...' -ForegroundColor Cyan
 vercel link --yes --project meme-api-inky 2>&1 | Out-Host
 
-# ─── 3. Env vars ───────────────────────────────────────────────────────────────
+# ─── 4. Env vars ───────────────────────────────────────────────────────────────
 # Read the rotated key straight off disk; it is never echoed.
 $envFile = Join-Path $projectRoot '.env'
 if (-not (Test-Path $envFile)) { throw "No .env found at $envFile" }
