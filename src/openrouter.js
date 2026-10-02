@@ -11,21 +11,89 @@
 //  so the text actually fits the format (that's what viral memes do).
 // ─────────────────────────────────────────────────────────────────────────────
 const ENDPOINT = 'https://openrouter.ai/api/v1/chat/completions'
+const CREDITS_ENDPOINT = 'https://openrouter.ai/api/v1/credits'
+
+// ─── Key verification ──────────────────────────────────────────────────────────
+// `OPEN_ROUTER_API_KEY is set` and `the key works` are different claims, and only
+// the second one matters. A revoked or mistyped key still passes a presence
+// check, which is how a dead key once made /api/health report green while every
+// generate call 502'd. So we actually authenticate.
+//
+// Cached, because health probes run every ~30s on most hosts and this is a real
+// network round-trip to a third party. A stale-true window of a few minutes is
+// harmless; hammering OpenRouter to re-confirm it is not.
+const KEY_CHECK_TTL_MS = 5 * 60_000
+let keyCheckCache = null
+
+export async function verifyApiKey() {
+  const apiKey = process.env.OPEN_ROUTER_API_KEY
+  if (!apiKey) {
+    return { valid: false, configured: false, detail: 'OPEN_ROUTER_API_KEY is not set' }
+  }
+
+  const now = Date.now()
+  if (keyCheckCache && now - keyCheckCache.at < KEY_CHECK_TTL_MS) {
+    return keyCheckCache
+  }
+
+  let result
+  try {
+    const res = await fetch(CREDITS_ENDPOINT, {
+      headers: { Authorization: `Bearer ${apiKey}` },
+      signal: AbortSignal.timeout(10_000),
+    })
+
+    if (res.ok) {
+      const { data } = await res.json().catch(() => ({ data: null }))
+      result = { valid: true, configured: true, detail: null, credits: data?.total_credits ?? null }
+    } else {
+      result = {
+        valid: false,
+        configured: true,
+        // 401 is the one that bites in practice: a revoked or mistyped key.
+        detail: `OpenRouter rejected the key (HTTP ${res.status})`,
+      }
+    }
+  } catch (err) {
+    // A network blip must NOT be reported as a bad key — that would send you
+    // off rotating a perfectly good key.
+    result = { valid: null, configured: true, detail: `Could not reach OpenRouter: ${err.message}` }
+  }
+
+  keyCheckCache = { ...result, at: now }
+  return keyCheckCache
+}
 
 // NOTE: OpenRouter's free catalog changes often. If these all 404, run
 // `GET https://openrouter.ai/api/v1/models` and swap in current `:free` ids
 // (or set OPENROUTER_MODEL in .env).
 //
-// Only ids verified to actually answer are listed. Retired-from-free ids
-// (gpt-oss-20b, nemotron-3-nano, ling-3.0-flash) were removed: they answer 404
-// instantly and just burn a slot in the fallback loop.
+// Ordered by what we've actually seen answer, fastest viable first.
+//
+// Verified ids lead. The newer/faster free ids are kept as fallbacks rather than
+// promoted: when these were first added, `laguna-xs`, `qwen3.8-27b` and
+// `gemma-4-26b` all answered 429 immediately on a free key, so leading with them
+// just burned fallback slots before reaching one that works.
+//
+// Deliberately excluded:
+//   • nvidia/nemotron-3.5-content-safety:free — a classifier, it doesn't write
+//   • cohere/north-mini-code:free            — code-tuned, poor at humour
+//   • nemotron-3-super-120b / ultra-550b      — too large to answer in time
+//   • nemotron-3-nano-omni-30b-...-reasoning  — slow and multimodal
+//
+// Removed ids that no longer exist in the catalog: `ling-3.0-flash-fin` (the
+// live one is `ling-3.0-flash-sante`), and a duplicated
+// `nemotron-3.5-lightning` that was burning a fallback slot on every request.
 const DEFAULT_MODELS = [
   'dots-studio/dots-3-note-preview:free',
+  'thinkingmachines/inkling-small:free',
   'liquid/lfm-2.5-2.6b:free',
   'nvidia/nemotron-3.5-lightning:free',
-  'inclusionai/ling-3.0-flash-fin:free',
-  'nvidia/nemotron-3.5-lightning:free',
-  'thinkingmachines/inkling-small:free'
+  'inclusionai/ling-3.0-flash-sante:free',
+  'poolside/laguna-xs-2.1:free',
+  'qwen/qwen3.8-27b:free',
+  'google/gemma-4-26b-a4b-it:free',
+  'poolside/laguna-s-2.1:free',
 ]
 
 // Resolved per call rather than at import time, and de-duplicated: an override
@@ -75,13 +143,25 @@ export async function generateMemeTexts(theme, templates) {
     if (Date.now() >= deadline) break
 
     try {
+      const startedAt = Date.now()
       const texts = await callModel(apiKey, model, prompt, deadline)
       if (texts.length >= 1) {
         DEMOTED_UNTIL.delete(model)
+        // Log the winner and how long it took. Without this the fallback loop is
+        // a black box: you can only infer which model is healthy from how long
+        // the request took, which makes tuning the list guesswork.
+        console.log(`[openrouter] ${model} answered in ${Date.now() - startedAt}ms`)
         return normalize(texts, templates.length)
       }
       lastError = new Error(`${model} replied without any usable meme text`)
     } catch (err) {
+      // A bad key or an empty quota fails identically on every model, so
+      // retrying the rest of the list just burns the full request budget to
+      // arrive at the same error. Bail out on the first one.
+      if (err.auth) {
+        DEMOTED_UNTIL.delete(model)
+        throw err
+      }
       lastError = err
     }
 
@@ -159,8 +239,32 @@ async function callModel(apiKey, model, prompt, deadline) {
     throw new Error(`no answer within ${Math.round(budget / 1000)}s`)
   }
 
-  // fetch does NOT throw on 4xx/5xx — check res.ok yourself (Week 1, Slide 22).
+  // fetch does NOT throw on 4xx/5xx — check res.ok yourself.
   if (!res.ok) {
+    // Only 401 genuinely means the key itself is bad, and that's worth
+    // aborting on: no model will accept it, so trying the rest of the list just
+    // spends the whole request budget to reach the same conclusion.
+    if (res.status === 401) {
+      throw Object.assign(
+        new Error(
+          'OpenRouter rejected OPEN_ROUTER_API_KEY. It is probably revoked, mistyped, or belongs to a different account — create a new key at https://openrouter.ai/keys'
+        ),
+        { auth: true, status: 401 }
+      )
+    }
+
+    // 403 is NOT an auth failure here. OpenRouter uses it for "this model isn't
+    // available on your plan/key" (observed on free-tier ids like
+    // thinkingmachines/inkling-small:free), so the correct response is to skip
+    // that model exactly like a 404 — aborting would let one restricted model
+    // kill every request.
+    if (res.status === 402) {
+      throw Object.assign(new Error('OpenRouter reports no remaining credit on this key.'), {
+        auth: true,
+        status: 402,
+      })
+    }
+
     throw new Error(`OpenRouter responded ${res.status}`)
   }
 

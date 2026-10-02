@@ -17,6 +17,7 @@ import express from 'express'
 import cors from 'cors'
 import rateLimit from 'express-rate-limit'
 import { createMemes } from './memes-core.js'
+import { verifyApiKey } from './openrouter.js'
 
 const app = express()
 app.disable('x-powered-by')
@@ -65,13 +66,30 @@ app.use(
 
 app.use(express.json({ limit: '16kb' }))
 
-// Cheap "is it up?" probe — also the fastest way to confirm a deploy is live and
-// that its env vars actually loaded.
-app.get('/api/health', (_req, res) => {
-  res.json({
-    ok: true,
-    keyConfigured: Boolean(process.env.OPEN_ROUTER_API_KEY),
-  })
+// Cheap "is it up?" probe — also the fastest way to confirm a deploy is live.
+//
+// It genuinely verifies the OpenRouter key rather than just checking the env
+// var is present, because those are different things: a revoked key passes a
+// presence check and then turns every generate into a 502. The upstream call is
+// cached inside verifyApiKey() so a 30s health probe doesn't hammer OpenRouter.
+//
+// Returns 200 even when the key is bad, on purpose: a dead key isn't a reason to
+// tell the platform this instance is unhealthy, and Render would react by
+// restarting a perfectly good process in a loop. Pass ?strict=1 to get a 503
+// instead, which is what you want when a CI step should fail on it.
+app.get('/api/health', async (req, res) => {
+  const key = await verifyApiKey()
+  const healthy = key.valid !== false
+
+  const body = {
+    ok: healthy,
+    keyConfigured: key.configured,
+    keyValid: key.valid,
+    ...(key.detail ? { detail: key.detail } : {}),
+    ...(key.credits != null ? { credits: key.credits } : {}),
+  }
+
+  res.status(req.query.strict === '1' && !healthy ? 503 : 200).json(body)
 })
 
 // A real request costs an OpenRouter call and occupies the process for up to
