@@ -129,9 +129,25 @@ process.on('unhandledRejection', (err) => {
 
 const PORT = process.env.PORT || 8787
 
-app.listen(PORT, () => {
-  console.log(`🔥 meme-api listening on http://localhost:${PORT}`)
-  if (!process.env.OPEN_ROUTER_API_KEY) {
-    console.warn('⚠️  OPEN_ROUTER_API_KEY is missing — requests will fail until .env is set')
-  }
-})
+// This file is BOTH the entry point and the handler, so the same code can run
+// as a long-lived process or as a serverless function.
+//
+// • Render / Docker / `node src/index.js` → we must bind a port and keep
+//   listening, because there's a real server sitting behind the hostname.
+// • Vercel / Lambda → there is no server to bind. The platform imports this
+//   module and invokes the exported `app` once per request, then freezes it.
+//   Calling listen() here would open a socket nobody routes to, and the real
+//   request would hang until it timed out.
+const isServerless = Boolean(process.env.VERCEL || process.env.AWS_LAMBDA_FUNCTION_NAME)
+
+// Required so serverless platforms can treat `app` as a request handler.
+export default app
+
+if (!isServerless) {
+  app.listen(PORT, () => {
+    console.log(`🔥 meme-api listening on http://localhost:${PORT}`)
+    if (!process.env.OPEN_ROUTER_API_KEY) {
+      console.warn('⚠️  OPEN_ROUTER_API_KEY is missing — requests will fail until .env is set')
+    }
+  })
+}
